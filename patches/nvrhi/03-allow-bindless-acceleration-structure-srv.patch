@@ -1,0 +1,20 @@
+--- a/src/validation/validation-device.cpp
++++ b/src/validation/validation-device.cpp
+@@ -1545,6 +1545,7 @@
+                 case ResourceType::RawBuffer_SRV:
+                 case ResourceType::RawBuffer_UAV:
+                 case ResourceType::ConstantBuffer:
++                case ResourceType::RayTracingAccelStruct:
+                     // Valid descriptors
+                     break;
+                 case ResourceType::Sampler:
+@@ -1559,9 +1560,6 @@
+                 case ResourceType::PushConstants:
+                     errorStream << "ResourceType::PushConstants is not allowed for bindless layouts with LayoutType::MutableSrvUavCbv." << std::endl;
+                     return false;
+-                case ResourceType::RayTracingAccelStruct:
+-                    errorStream << "ResourceType::RayTracingAccelStruct is not allowed for bindless layouts with LayoutType::MutableSrvUavCbv." << std::endl;
+-                    return false;
+                 default:
+                     // Invalid resource types will be dealt with later in this function.
+                     break;

@@ -1,0 +1,11 @@
+/build/
+/out/
+/cmake-build-*/
+/_deps/
+/.vs/
+/CMakeUserPresets.json
+
+# Generated effect artifacts.
+*.dxil
+*.dep
+*.desc

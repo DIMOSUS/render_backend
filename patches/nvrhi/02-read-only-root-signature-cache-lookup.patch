@@ -1,0 +1,14 @@
+--- a/src/d3d12/d3d12-resource-bindings.cpp
++++ b/src/d3d12/d3d12-resource-bindings.cpp
+@@ -802,7 +802,10 @@
+         hash_combine(hash, allowInputLayout ? 1u : 0u);
+         
+         // Get a cached RS and AddRef it (if it exists)
+-        RefCountPtr<RootSignature> rootsig = m_Resources.rootsigCache[hash];
++        RefCountPtr<RootSignature> rootsig;
++        auto cachedRootsig = m_Resources.rootsigCache.find(hash);
++        if (cachedRootsig != m_Resources.rootsigCache.end())
++            rootsig = cachedRootsig->second;
+ 
+         if (!rootsig)
+         {

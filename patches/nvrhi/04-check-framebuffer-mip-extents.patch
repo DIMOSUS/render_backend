@@ -1,0 +1,65 @@
+--- a/src/d3d12/d3d12-backend.h
++++ b/src/d3d12/d3d12-backend.h
+@@ -585,8 +585,6 @@
+         static_vector<TextureHandle, c_MaxRenderTargets + 1> textures;
+         static_vector<DescriptorIndex, c_MaxRenderTargets> RTVs;
+         DescriptorIndex DSV = c_InvalidDescriptorIndex;
+-        uint32_t rtWidth = 0;
+-        uint32_t rtHeight = 0;
+ 
+         Framebuffer(DeviceResources& resources)
+             : m_Resources(resources)
+--- a/src/d3d12/d3d12-graphics.cpp
++++ b/src/d3d12/d3d12-graphics.cpp
+@@ -215,31 +215,28 @@
+         return GraphicsPipelineHandle::Create(pso);
+     }
+ 
++#ifndef NDEBUG
++    static bool framebufferAttachmentMatches(const TextureDesc& texture, const TextureSubresourceSet& view,
++        const FramebufferInfoEx& framebuffer)
++    {
++        const uint32_t mip = view.resolve(texture, true).baseMipLevel;
++        return std::max(texture.width >> mip, 1u) == framebuffer.width &&
++            std::max(texture.height >> mip, 1u) == framebuffer.height;
++    }
++#endif
++
+     FramebufferHandle Device::createFramebuffer(const FramebufferDesc& desc)
+     {
+         Framebuffer *fb = new Framebuffer(m_Resources);
+         fb->desc = desc;
+         fb->framebufferInfo = FramebufferInfoEx(desc);
+ 
+-        if (!desc.colorAttachments.empty())
+-        {
+-            Texture* texture = checked_cast<Texture*>(desc.colorAttachments[0].texture);
+-            fb->rtWidth = texture->desc.width;
+-            fb->rtHeight = texture->desc.height;
+-        } else if (desc.depthAttachment.valid())
+-        {
+-            Texture* texture = checked_cast<Texture*>(desc.depthAttachment.texture);
+-            fb->rtWidth = texture->desc.width;
+-            fb->rtHeight = texture->desc.height;
+-        }
+-
+         for (size_t rt = 0; rt < desc.colorAttachments.size(); rt++)
+         {
+             auto& attachment = desc.colorAttachments[rt];
+ 
+             Texture* texture = checked_cast<Texture*>(attachment.texture);
+-            assert(texture->desc.width == fb->rtWidth);
+-            assert(texture->desc.height == fb->rtHeight);
++            assert(framebufferAttachmentMatches(texture->desc, attachment.subresources, fb->framebufferInfo));
+ 
+             DescriptorIndex index = m_Resources.renderTargetViewHeap.allocateDescriptor();
+ 
+@@ -253,7 +250,6 @@
+         if (desc.depthAttachment.valid())
+         {
+             Texture* texture = checked_cast<Texture*>(desc.depthAttachment.texture);
+-            assert(texture->desc.width == fb->rtWidth);
+-            assert(texture->desc.height == fb->rtHeight);
++            assert(framebufferAttachmentMatches(texture->desc, desc.depthAttachment.subresources, fb->framebufferInfo));
+ 
+             DescriptorIndex index = m_Resources.depthStencilViewHeap.allocateDescriptor();
