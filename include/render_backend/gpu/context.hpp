@@ -8,6 +8,7 @@
 #include <atomic>
 #include <new>
 #include <nvrhi/nvrhi.h>
+#include <optional>
 #include <render_backend/gpu/resource_use.hpp>
 #include <stdint.h>
 #include <string.h>
@@ -311,6 +312,7 @@ template <class C> constexpr uint32_t commandBytes(uint32_t dataBytes)
 
 class FrameContexts;
 class Player;
+class Recorder;
 
 // A context has one producer until it is sealed or cancelled.
 class CommandContext
@@ -419,7 +421,7 @@ class FrameContexts
   public:
 	static constexpr uint32_t C_FIRST_RUN = 1u << 10;
 	static constexpr uint32_t C_CHUNK = 64u << 10;
-	static constexpr uint32_t C_ARENA = 16u << 20;
+	static constexpr uint32_t C_ARENA = 128u << 20;
 	static constexpr uint32_t C_CONTEXTS = 8192;
 
 	// Provide host tag dimensions in [1, 256]. Out-of-range tags count in the last slot.
@@ -609,6 +611,8 @@ class FrameContexts
 class Player
 {
   public:
+	Player(const Player &) = delete;
+	Player &operator=(const Player &) = delete;
 	nvrhi::ICommandList *list = nullptr;
 	markers::Stack		*markers = nullptr; // Null when markers are disabled.
 	virtual void		 application(const ApplicationCommand &, const uint8_t *)
@@ -626,7 +630,13 @@ class Player
 	virtual void slotsEnd() = 0;
 
   protected:
+	Player() = default;
 	~Player() = default;
+
+  private:
+	friend class Recorder;
+	Recorder *m_pendingDirect = nullptr;
+	Recorder *m_boundDirect = nullptr;
 };
 
 // Playback state of one context: the marker stack levels of its open ranges, the open pass (its framebuffer is held
@@ -646,17 +656,17 @@ bool playCommand(const uint8_t *command, PlayState &state, Player &player);
 void endPlay(PlayState &state, Player &player);
 
 // Destination for a unit of commands. Records either into a context, played later, or, when the context could not
-// reserve the unit, directly into a command list. In direct mode each command is built in a scratch buffer and played
-// through the normal playback path when the next command is added or the unit finishes, so the same code and NVRHI
-// calls are used in both modes. Before recording directly, the caller must play every context that should precede the
-// unit.
+// reserve the unit, directly into a command list. Direct recorders on one player execute commands in add() order.
+// Their scopes may overlap between passes, compute bindings and marker ranges on the same playback thread. Each command
+// owns its bytes until playback returns. Scratch caches storage from completed commands. Finish direct units before
+// switching lists or resuming buffered playback, and play preceding contexts before recording directly.
 class Recorder
 {
   public:
 	explicit Recorder(CommandContext *context) : m_context(context)
 	{
 	}
-	Recorder(Player &player, eastl::vector<uint8_t> &scratch) : m_player(&player), m_scratch(&scratch)
+	Recorder(Player &player, eastl::vector<uint8_t> &scratch) : m_direct(std::in_place, player, scratch)
 	{
 	}
 	Recorder(const Recorder &) = delete;
@@ -666,21 +676,21 @@ class Recorder
 		finish();
 	}
 	// A command of type C followed by `dataBytes` of payload (CommandContext::data). The caller must fill it before the
-	// next add() or finish(). Null for an oversized command or a full arena.
+	// next add() (including on another direct recorder using this player) or finish(). Null for an oversized command,
+	// a full arena, a finished direct recorder, or a direct recording that would interrupt another unit's open state.
 	template <class C> C *add(uint32_t dataBytes = 0)
 	{
 		if (m_context != nullptr)
 			return m_context->add<C>(dataBytes);
 		const uint32_t size = commandBytes<C>(dataBytes);
-		if (size == 0)
+		if (size == 0 || !m_direct)
 			return nullptr;
-		playPending();
-		if (m_scratch->size() < size)
-			m_scratch->resize(size);
-		C *c = new (m_scratch->data()) C{};
+		void *storage = beginDirectCommand(size);
+		if (storage == nullptr)
+			return nullptr;
+		C *c = new (storage) C{};
 		c->header.type = uint32_t(C::C_TYPE);
 		c->header.size = size;
-		m_pending = true;
 		return c;
 	}
 	template <class C> C *add(const void *data, uint32_t bytes)
@@ -693,27 +703,40 @@ class Recorder
 	// Ends the unit. In direct mode, plays the last command and closes any open pass and marker ranges.
 	void finish()
 	{
-		if (m_player == nullptr)
-			return;
-		playPending();
-		endPlay(m_state, *m_player);
-		m_player = nullptr;
+		if (m_direct)
+			finishDirect();
 	}
 
   private:
-	void playPending()
+	struct DirectRecording
 	{
-		if (m_pending)
+		enum class Completion
 		{
-			m_pending = false;
-			playCommand(m_scratch->data(), m_state, *m_player);
+			Open,
+			Requested,
+			Closed
+		};
+		DirectRecording(Player &player, eastl::vector<uint8_t> &scratch) : player(player), scratch(scratch)
+		{
 		}
-	}
-	CommandContext		   *m_context = nullptr;
-	Player				   *m_player = nullptr;
-	eastl::vector<uint8_t> *m_scratch = nullptr;
-	PlayState				m_state;
-	bool					m_pending = false;
+		bool hasOpenState() const
+		{
+			return state.pass != nullptr || state.computeBound || state.open != 0;
+		}
+		Player &player;
+		eastl::vector<uint8_t> &scratch;
+		eastl::vector<uint8_t> command;
+		PlayState state;
+		Completion completion = Completion::Open;
+		bool playing = false;
+	};
+	void *beginDirectCommand(uint32_t size);
+	void playDirectCommand();
+	void finishDirect();
+	void closeDirect();
+
+	CommandContext *m_context = nullptr;
+	std::optional<DirectRecording> m_direct;
 };
 
 // Marker ranges. markerPushTo copies the name, truncated to C_MARKER_NAME - 1 characters. MarkerPop closes the

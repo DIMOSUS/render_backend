@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdio>
 #include <render_backend/gpu/context.hpp>
+#include <render_backend/gpu/markers.hpp>
 #include <thread>
 
 using namespace render_backend::gpu::ctx;
@@ -29,6 +30,9 @@ public:
   TextureUse textureUse{};
   BufferUse bufferUse{};
   uint32_t declarations = 0;
+  nvrhi::ITexture *expectedWrite = nullptr;
+  uint32_t writes = 0;
+  uint32_t writtenAfter = 0;
 
   void application(const ApplicationCommand &command,
                    const uint8_t *payload) override {
@@ -49,8 +53,10 @@ public:
     textureUse = uses.textures[0];
     bufferUse = uses.buffers[0];
   }
-  void written(nvrhi::ITexture *, nvrhi::TextureSubresourceSet) override {
-    invalid = true;
+  void written(nvrhi::ITexture *texture, nvrhi::TextureSubresourceSet) override {
+    invalid |= texture == nullptr || texture != expectedWrite;
+    ++writes;
+    writtenAfter = count;
   }
   void staged(const StagedUpload &) override { invalid = true; }
   void slot(uint8_t, uint8_t) override { invalid = true; }
@@ -290,6 +296,16 @@ private:
   nvrhi::BufferDesc desc;
 };
 
+class TestFramebuffer final : public nvrhi::RefCounter<nvrhi::IFramebuffer> {
+public:
+  const nvrhi::FramebufferDesc &getDesc() const override { return desc; }
+  const nvrhi::FramebufferInfoEx &getFramebufferInfo() const override { return info; }
+
+private:
+  nvrhi::FramebufferDesc desc;
+  nvrhi::FramebufferInfoEx info;
+};
+
 bool resourceDeclaration() {
   TestTexture texture;
   TestBuffer buffer;
@@ -393,6 +409,142 @@ bool arenaLimits() {
                "arena did not become usable for the next frame");
 }
 
+bool overlappingDirectRecorders() {
+  FrameOwner owner;
+  FrameContexts &frame = owner.frame;
+  if (!check(frame.create(), "allocate arena for direct playback"))
+    return false;
+  auto *context = frame.make(ContextKey::make(1, 1), "fill the arena");
+  constexpr uint32_t C_FILL_BYTES = FrameContexts::C_ARENA - 32;
+  constexpr uint32_t C_FILL_COMMAND_BYTES = 1u << 20;
+  constexpr uint32_t C_UNIT_BYTES = 2 * commandBytes<Written>(0);
+  if (!check(context && context->reserve(C_FILL_BYTES), "reserve the arena for a large run"))
+    return false;
+  for (uint32_t remaining = C_FILL_BYTES; remaining != 0;) {
+    const uint32_t bytes = remaining < C_FILL_COMMAND_BYTES ? remaining : C_FILL_COMMAND_BYTES;
+    if (!check(context->add<ApplicationCommand>(bytes - sizeof(ApplicationCommand)) != nullptr, "fill the large run"))
+      return false;
+    remaining -= bytes;
+  }
+  if (!check(!context->reserve(C_UNIT_BYTES) && frame.directUnits() == 1,
+             "the arena did not force direct playback"))
+    return false;
+
+  TestTexture texture;
+  texture.AddRef(); // Keep the texture alive if playback releases an extra reference.
+  const auto initialRefs = texture.GetRefCount();
+  Capture<> capture;
+  capture.expectedWrite = &texture;
+  eastl::vector<uint8_t> scratch;
+  {
+    Recorder draw(capture, scratch);
+    const uint32_t before = 1, after = 2;
+    draw.add<ApplicationCommand>(&before, sizeof before);
+    {
+      Recorder transition(capture, scratch);
+      auto *written = transition.add<Written>();
+      written->texture = &texture;
+      texture.AddRef();
+    }
+    draw.add<ApplicationCommand>(&after, sizeof after);
+  }
+  return check(!capture.invalid && capture.count == 2 && capture.values[0] == 1 && capture.values[1] == 2 &&
+                   capture.writes == 1 && capture.writtenAfter == 1 && texture.GetRefCount() == initialRefs,
+               "overlapping direct recorders changed playback order or resource ownership");
+}
+
+bool reentrantDirectPlayback() {
+  Capture<> capture;
+  eastl::vector<uint8_t> scratch;
+  struct CallbackData {
+    Capture<> &capture;
+    eastl::vector<uint8_t> &scratch;
+  } callbackData{capture, scratch};
+
+  Recorder outer(capture, scratch);
+  const uint32_t outerValue = 7;
+  auto *callback = outer.add<Callback>(&outerValue, sizeof outerValue);
+  callback->owner = &callbackData;
+  callback->valueBytes = sizeof outerValue;
+  callback->run = [](void *owner, nvrhi::ICommandList *, const uint8_t *data, uint32_t bytes) {
+    auto &state = *static_cast<CallbackData *>(owner);
+    uint32_t before = 0, after = 0;
+    memcpy(&before, data, sizeof before);
+    {
+      Recorder inner(state.capture, state.scratch);
+      // Force the inner recorder to grow its buffer while the outer callback is reading its payload.
+      const std::array<uint8_t, 1024> payload{};
+      auto *large = inner.add<Callback>(payload.data(), uint32_t(payload.size()));
+      large->run = [](void *, nvrhi::ICommandList *, const uint8_t *, uint32_t) {};
+      const uint32_t innerValue = 8;
+      inner.add<ApplicationCommand>(&innerValue, sizeof innerValue);
+    }
+    memcpy(&after, data, sizeof after);
+    state.capture.invalid |= bytes != sizeof before || before != 7 || after != before;
+  };
+  const uint32_t afterCallback = 9;
+  outer.add<ApplicationCommand>(&afterCallback, sizeof afterCallback);
+  outer.finish();
+  return check(!capture.invalid && capture.count == 2 && capture.values[0] == 8 && capture.values[1] == 9,
+               "nested playback invalidated an active callback payload");
+}
+
+bool directPassOwnership() {
+  TestFramebuffer framebuffer;
+  Capture<> capture;
+  eastl::vector<uint8_t> scratch;
+  Recorder pass(capture, scratch);
+  Recorder other(capture, scratch);
+  auto *begin = pass.add<BeginPass>();
+  begin->framebuffer = &framebuffer;
+  framebuffer.AddRef();
+  const uint32_t value = 1;
+  if (!check(other.add<ApplicationCommand>(&value, sizeof value) == nullptr && framebuffer.GetRefCount() == 2,
+             "a second direct recorder interrupted an open graphics pass"))
+    return false;
+  pass.add<EndPass>();
+  if (!check(other.add<ApplicationCommand>(&value, sizeof value) != nullptr && framebuffer.GetRefCount() == 1,
+             "the handoff did not play EndPass before accepting the next command"))
+    return false;
+  other.finish();
+  return check(!capture.invalid && capture.count == 1 && capture.values[0] == value,
+               "a rejected direct command was played or lost the next command");
+}
+
+bool finishDuringDirectPlayback() {
+  Capture<> capture;
+  render_backend::gpu::markers::Stack markers;
+  capture.markers = &markers;
+  eastl::vector<uint8_t> scratch;
+  struct CallbackData {
+    Recorder *recorder = nullptr;
+    render_backend::gpu::markers::Stack &markers;
+    bool requested = false;
+  } state{nullptr, markers};
+  const uint32_t value = 1;
+  {
+    Recorder recorder(capture, scratch);
+    state.recorder = &recorder;
+    markerPushTo(recorder, uint8_t(render_backend::gpu::markers::Kind::Item), "direct callback");
+    auto *callback = recorder.add<Callback>();
+    callback->owner = &state;
+    callback->run = [](void *owner, nvrhi::ICommandList *, const uint8_t *, uint32_t) {
+      auto &running = *static_cast<CallbackData *>(owner);
+      running.recorder->finish();
+      running.requested = running.markers.depth() == 1;
+    };
+    if (!check(recorder.add<ApplicationCommand>(&value, sizeof value) == nullptr && state.requested &&
+                   markers.depth() == 0,
+               "a callback did not defer finish until playback returned"))
+      return false;
+  }
+  Recorder next(capture, scratch);
+  next.add<ApplicationCommand>(&value, sizeof value);
+  next.finish();
+  return check(!capture.invalid && capture.count == 1 && capture.values[0] == value,
+               "a recorder closed during playback left a pending command");
+}
+
 bool contextLimit() {
   FrameOwner owner;
   FrameContexts &frame = owner.frame;
@@ -424,8 +576,12 @@ int main() {
   const bool publicationOk = publication();
   const bool resourcesOk = abandonedResources();
   const bool declarationOk = resourceDeclaration();
+  const bool overlapOk = overlappingDirectRecorders();
+  const bool reentrantOk = reentrantDirectPlayback();
+  const bool passOwnershipOk = directPassOwnership();
+  const bool callbackFinishOk = finishDuringDirectPlayback();
   return contextLimit() && orderOk && parallelOk && arenaOk && publicationOk &&
-                 resourcesOk && declarationOk
+                 resourcesOk && declarationOk && overlapOk && reentrantOk && passOwnershipOk && callbackFinishOk
              ? 0
              : 1;
 }

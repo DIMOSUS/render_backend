@@ -6,6 +6,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 
+#include "platform.hpp"
+
 using namespace render_backend::gpu::ctx;
 
 namespace
@@ -37,6 +39,75 @@ void render_backend::gpu::ctx::markerPushf(Recorder &r, uint8_t kind, const char
 	_vsnprintf_s(name, sizeof name, _TRUNCATE, format, args);
 	va_end(args);
 	markerPushTo(r, kind, name);
+}
+
+void *Recorder::beginDirectCommand(uint32_t size)
+{
+	DirectRecording &direct = *m_direct;
+	if (direct.completion != DirectRecording::Completion::Open)
+		return nullptr;
+	while (Recorder *pending = direct.player.m_pendingDirect)
+		pending->playDirectCommand();
+	// A playback callback may have requested that this unit finish.
+	if (direct.completion != DirectRecording::Completion::Open)
+		return nullptr;
+	const Recorder *bound = direct.player.m_boundDirect;
+	if (bound != nullptr && bound != this && bound->m_direct->hasOpenState())
+	{
+		diag::report(true, "command recorder", "Direct recording would interrupt an open pass, compute binding or marker");
+		return nullptr;
+	}
+
+	direct.command.swap(direct.scratch);
+	if (direct.command.size() < size)
+		direct.command.resize(size);
+	direct.player.m_pendingDirect = this;
+	return direct.command.data();
+}
+
+void Recorder::playDirectCommand()
+{
+	DirectRecording &direct = *m_direct;
+	direct.player.m_pendingDirect = nullptr;
+	// Playback callbacks can record again. Keep the current payload alive while they use the scratch cache.
+	eastl::vector<uint8_t> command;
+	command.swap(direct.command);
+	const bool wasPlaying = direct.playing;
+	direct.playing = true;
+	playCommand(command.data(), direct.state, direct.player);
+	direct.playing = wasPlaying;
+	if (command.capacity() > direct.scratch.capacity())
+		direct.scratch.swap(command);
+	if (direct.hasOpenState())
+		direct.player.m_boundDirect = this;
+	else if (direct.player.m_boundDirect == this)
+		direct.player.m_boundDirect = nullptr;
+	if (!wasPlaying && direct.completion == DirectRecording::Completion::Requested)
+		closeDirect();
+}
+
+void Recorder::finishDirect()
+{
+	DirectRecording &direct = *m_direct;
+	if (direct.completion != DirectRecording::Completion::Open)
+		return;
+	if (direct.playing)
+	{
+		direct.completion = DirectRecording::Completion::Requested;
+		return;
+	}
+	closeDirect();
+}
+
+void Recorder::closeDirect()
+{
+	DirectRecording &direct = *m_direct;
+	direct.completion = DirectRecording::Completion::Closed;
+	while (direct.player.m_pendingDirect == this)
+		playDirectCommand();
+	if (direct.player.m_boundDirect == this)
+		direct.player.m_boundDirect = nullptr;
+	endPlay(direct.state, direct.player);
 }
 
 //----------------------------------------------------------------------------------------------------------------------
@@ -168,7 +239,8 @@ bool FrameContexts::create(uint32_t viewTags, uint32_t passTags)
 	m_viewTags = viewTags;
 	m_passTags = passTags;
 	const uint32_t tagCount = viewTags * passTags;
-	m_memory = static_cast<uint8_t *>(heapAlloc(C_ARENA));
+	// Back the arena with demand-zero pages so startup only touches memory that gets used for commands.
+	m_memory = static_cast<uint8_t *>(VirtualAlloc(nullptr, C_ARENA, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
 	m_pool = static_cast<CommandContext *>(heapAlloc(sizeof(CommandContext) * C_CONTEXTS));
 	m_order = static_cast<uint32_t *>(heapAlloc(sizeof(uint32_t) * C_CONTEXTS));
 	m_tags[0].counts = static_cast<TagCounts::Count *>(heapAlloc(sizeof(TagCounts::Count) * tagCount * 2));
@@ -189,7 +261,8 @@ bool FrameContexts::create(uint32_t viewTags, uint32_t passTags)
 void FrameContexts::destroy()
 {
 	resetRecordings();
-	heapFree(m_memory);
+	if (m_memory != nullptr)
+		VirtualFree(m_memory, 0, MEM_RELEASE);
 	heapFree(m_pool); // CommandContext is trivially destructible.
 	heapFree(m_order);
 	heapFree(m_tags[0].counts);
